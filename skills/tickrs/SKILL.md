@@ -42,6 +42,19 @@ For CI/automation, set `TICKTICK_TOKEN` directly instead.
 - **Use `--force`** on delete commands to avoid interactive confirmation prompts.
 - **Use `--quiet`** when you only need to check success/failure via exit code.
 - **Set a default project** with `tickrs project use <name>` to avoid repeating `--project-id`.
+- **Use `$'...'` syntax for multi-line content** — bash will interpret `\n` as actual line breaks (see examples below).
+
+## Multi-line Content
+
+When passing multi-line text to `--content`, use bash's `$'...'` syntax to properly interpret `\n` as line breaks:
+
+```bash
+# Use $'...' for multi-line content
+tickrs task create --title "Follow up" --content $'Key points:\n- First point\n- Second point' --project-id abc123
+
+# Or concatenate with $'\n'
+tickrs task create --title "Notes" --content "Line 1"$'\n'"Line 2" --project-id abc123
+```
 
 ## Common Workflows
 
