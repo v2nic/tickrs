@@ -5,8 +5,11 @@ use tracing::{debug, instrument};
 
 use crate::config::TokenStorage;
 
-/// Base URL for TickTick Open API
+/// Base URL for TickTick Open API v1
 pub const API_BASE_URL: &str = "https://api.ticktick.com/open/v1";
+
+/// Base URL for TickTick Internal API v2
+pub const API_V2_BASE_URL: &str = "https://api.ticktick.com/api/v2";
 
 /// TickTick API client wrapper
 #[derive(Debug, Clone)]
@@ -14,6 +17,10 @@ pub struct TickTickClient {
     client: Client,
     token: String,
     base_url: String,
+    /// Session cookies for v2 API authentication
+    session_cookies: Option<String>,
+    /// X-Device header for v2 API
+    x_device: String,
 }
 
 /// API error response from TickTick
@@ -65,16 +72,109 @@ impl TickTickClient {
             .build()
             .context("Failed to create HTTP client")?;
 
+        // Generate a device ID similar to what TickTickPy uses
+        // Format: {"platform":"web","os":"OS X","device":"Firefox 95.0","name":"unofficial api!","version":4531,"id":"6490<hex>","channel":"website","campaign":"","websocket":""}
+        let device_id = format!(
+            r#"{{"platform":"web","os":"OS X","device":"Firefox 95.0","name":"unofficial api!","version":4531,"id":"6490{:x}","channel":"website","campaign":"","websocket":""}}"#,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                as u64
+        );
+
         Ok(Self {
             client,
             token,
             base_url,
+            session_cookies: None,
+            x_device: device_id,
         })
+    }
+
+    /// Login to the v2 API using username/password and return session cookies
+    pub async fn login_v2(&mut self, username: &str, password: &str) -> Result<(), ApiError> {
+        debug!("Logging in to v2 API as {}", username);
+
+        #[derive(Debug, serde::Serialize)]
+        struct LoginRequest {
+            username: String,
+            password: String,
+        }
+
+        #[derive(Debug, serde::Deserialize)]
+        struct LoginResponse {
+            token: String,
+        }
+
+        let request = LoginRequest {
+            username: username.to_string(),
+            password: password.to_string(),
+        };
+
+        let response = self
+            .client
+            .post(self.url_v2("/user/signon?wc=true&remember=true"))
+            .json(&request)
+            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:95.0) Gecko/20100101 Firefox/95.0")
+            .header("X-Csrftoken", "")
+            .header("X-Device", &self.x_device)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Referer", "https://ticktick.com/")
+            .send()
+            .await
+            .map_err(|e| ApiError::NetworkError(e))?;
+
+        let status = response.status();
+        if status != 200 {
+            let text = response.text().await.unwrap_or_default();
+            return Err(ApiError::ServerError(format!(
+                "Login failed with status {}: {}",
+                status, text
+            )));
+        }
+
+        // Extract token from response
+        let login_response: LoginResponse = response.json().await
+            .map_err(|e| ApiError::ParseError(format!("Failed to parse login response: {}", e)))?;
+
+        // Update the stored token
+        self.token = login_response.token.clone();
+
+        // Set session cookie
+        self.session_cookies = Some(format!("t={}", login_response.token));
+
+        debug!("Successfully logged in to v2 API");
+        Ok(())
+    }
+
+    /// Set the v2 session token directly (for when login is unavailable)
+    pub fn set_v2_token(&mut self, token: &str) {
+        self.token = token.to_string();
+        self.session_cookies = Some(format!("t={}", token));
+        debug!("Set v2 session token");
+    }
+
+    /// Get the full inbox project ID (e.g., "inbox127635041" instead of just "inbox")
+    pub async fn get_inbox_id(&self) -> Result<String, ApiError> {
+        #[derive(Debug, serde::Deserialize)]
+        struct InboxResponse {
+            id: String,
+        }
+
+        let response: InboxResponse = self.get_v2("/project/inbox").await?;
+        Ok(response.id)
     }
 
     /// Build the full URL for an endpoint
     fn url(&self, endpoint: &str) -> String {
         format!("{}{}", self.base_url, endpoint)
+    }
+
+    /// Build the full URL for v2 API endpoint
+    fn url_v2(&self, endpoint: &str) -> String {
+        format!("{}{}", API_V2_BASE_URL, endpoint)
     }
 
     /// Make a GET request to the API
@@ -127,6 +227,55 @@ impl TickTickClient {
         self.handle_response(response).await
     }
 
+    /// Make a POST request to the v2 API with JSON body
+    /// Make a POST request to the v2 API that returns empty body on success
+    /// Uses Cookie-based authentication (not Bearer token)
+    #[instrument(skip(self, body), fields(endpoint = %endpoint))]
+    pub async fn post_v2_empty<B: serde::Serialize>(
+        &self,
+        endpoint: &str,
+        body: &B,
+    ) -> Result<(), ApiError> {
+        debug!("POST v2 {} (expecting empty body)", endpoint);
+
+        // Use session cookie for authentication (not Bearer token)
+        let cookie = format!("t={}", self.token);
+        
+        let request = self
+            .client
+            .post(self.url_v2(endpoint))
+            .header("X-Device", &self.x_device)
+            .header("Cookie", cookie)
+            .header("X-Csrftoken", "")
+            .json(body);
+
+        let response = request.send().await?;
+
+        let status = response.status();
+        
+        match status {
+            StatusCode::OK | StatusCode::CREATED | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::UNAUTHORIZED => Err(ApiError::Unauthorized),
+            StatusCode::NOT_FOUND => Err(ApiError::NotFound(response.url().to_string())),
+            StatusCode::BAD_REQUEST => {
+                let text = response.text().await.unwrap_or_default();
+                Err(ApiError::BadRequest(text))
+            }
+            StatusCode::TOO_MANY_REQUESTS => Err(ApiError::RateLimited),
+            _ if status.is_server_error() => {
+                let text = response.text().await.unwrap_or_default();
+                Err(ApiError::ServerError(format!("{}: {}", status, text)))
+            }
+            _ => {
+                let text = response.text().await.unwrap_or_default();
+                Err(ApiError::ServerError(format!(
+                    "Unexpected status {}: {}",
+                    status, text
+                )))
+            }
+        }
+    }
+
     /// Make a DELETE request to the API
     #[instrument(skip(self), fields(endpoint = %endpoint))]
     pub async fn delete(&self, endpoint: &str) -> Result<(), ApiError> {
@@ -140,6 +289,26 @@ impl TickTickClient {
             .await?;
 
         self.handle_empty_response(response).await
+    }
+
+    /// Make a GET request to the v2 API
+    #[instrument(skip(self), fields(endpoint = %endpoint))]
+    pub async fn get_v2<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T, ApiError> {
+        debug!("GET v2 {}", endpoint);
+
+        // Use session cookie for authentication
+        let cookie = format!("t={}", self.token);
+
+        let response = self
+            .client
+            .get(self.url_v2(endpoint))
+            .header("X-Device", &self.x_device)
+            .header("Cookie", cookie)
+            .header("X-Csrftoken", "")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
     }
 
     /// Handle API response and parse JSON
