@@ -573,6 +573,15 @@ async fn cmd_task(cmd: TaskCommands, format: OutputFormat, quiet: bool) -> anyho
 async fn resolve_project_name(name: &str) -> anyhow::Result<String> {
     let client = TickTickClient::new()?;
     let projects = client.list_projects().await?;
+    
+    // Special case for Inbox - the API requires the full ID with user ID
+    if name.eq_ignore_ascii_case("inbox") {
+        // Get the full inbox ID from the API
+        if let Ok(inbox_project) = client.get_project("inbox").await {
+            return Ok(inbox_project.id);
+        }
+    }
+    
     let project = projects
         .iter()
         .find(|p| p.name.eq_ignore_ascii_case(name))
@@ -780,7 +789,120 @@ async fn cmd_task_update(
     format: OutputFormat,
     quiet: bool,
 ) -> anyhow::Result<()> {
-    let project_id = get_project_id(project_id, project_name).await?;
+    let target_project_id = get_project_id(project_id, project_name).await
+        .map_err(|e| anyhow::anyhow!("Failed to resolve project: {}", e))?;
+    
+    let config = Config::load()
+        .map_err(|e| anyhow::anyhow!("Failed to load config from {:?}: {}", Config::config_path().unwrap_or_default(), e))?;
+    
+    let client = TickTickClient::new()
+        .map_err(|e| anyhow::anyhow!("Failed to create client: {}", e))?;
+
+    // Get the current task - first try inbox (most common), then target project
+    let current_task = match client.get_task("inbox", task_id).await {
+        Ok(task) => task,
+        Err(_) => {
+            // Try target project if not in inbox
+            match client.get_task(&target_project_id, task_id).await {
+                Ok(task) => task,
+                Err(_) => {
+                    // Try Journal project as fallback
+                    client.get_task("6841b08779c7d1fab649e906", task_id).await
+                        .map_err(|e| anyhow::anyhow!("Failed to get task: {}", e))?
+                }
+            }
+        }
+    };
+
+    let current_project_id = &current_task.project_id;
+
+    // Check if this is just a project move (no other changes)
+    let is_project_move_only = title.is_none()
+        && content.is_none()
+        && priority.is_none()
+        && tags.is_none()
+        && date.is_none()
+        && start.is_none()
+        && due.is_none()
+        && all_day.is_none()
+        && timezone.is_none()
+        && items.is_none();
+
+    // If project is changing and no other fields are being updated, use v2 API move
+    if target_project_id != *current_project_id && is_project_move_only {
+        // Create mutable client for v2 login
+        let mut client_for_move = TickTickClient::new()
+            .map_err(|e| anyhow::anyhow!("Failed to create client: {}", e))?;
+        
+        // Set v2 session if token is provided
+        if let Some(ref v2_token) = config.v2_token {
+            client_for_move.set_v2_token(v2_token);
+        } else if let (Some(ref username), Some(ref password)) = (&config.username, &config.password) {
+            // Otherwise try to login with username/password
+            client_for_move.login_v2(username, password).await
+                .map_err(|e| anyhow::anyhow!(
+                    "Failed to login to v2 API: {}.\n\n\
+                    Alternative: Set v2_token directly in config.toml with a session token\n\
+                    extracted from your browser after logging in.", e))?;
+        } else {
+            return Err(anyhow::anyhow!(
+                "Cannot move tasks between projects: v2 API authentication required.\n\
+                Either set username and password, or set v2_token in {}:\n\n\
+                # Option 1: Login with credentials (may be rate-limited)\n\
+                username = \"your@email.com\"\n\
+                password = \"your-password\"\n\n\
+                # Option 2: Use a pre-obtained session token\n\
+                # (extract from browser cookies after logging in to TickTick)\n\
+                v2_token = \"your-session-token\"",
+                Config::config_path().unwrap_or_default().display()
+            ));
+        }
+        
+        client_for_move.move_task(task_id, current_project_id, &target_project_id).await
+            .map_err(|e| anyhow::anyhow!("Failed to move task: {}", e))?;
+
+        if quiet {
+            return Ok(());
+        }
+
+        match format {
+            OutputFormat::Json => {
+                let data = TaskData { task: current_task };
+                let response = JsonResponse::success_with_message(data, "Task moved successfully");
+                println!("{}", response.to_json_string());
+            }
+            OutputFormat::Text => {
+                println!("Task moved successfully");
+            }
+        }
+        return Ok(());
+    }
+
+    // If project is changing (with other updates), move first then update
+    if target_project_id != *current_project_id {
+        // Create mutable client for v2 login
+        let mut client_for_move = TickTickClient::new()
+            .map_err(|e| anyhow::anyhow!("Failed to create client: {}", e))?;
+        
+        // Set v2 session if token is provided
+        if let Some(ref v2_token) = config.v2_token {
+            client_for_move.set_v2_token(v2_token);
+        } else if let (Some(ref username), Some(ref password)) = (&config.username, &config.password) {
+            client_for_move.login_v2(username, password).await
+                .map_err(|e| anyhow::anyhow!(
+                    "Failed to login to v2 API: {}.\n\n\
+                    Alternative: Set v2_token directly in config.toml.", e))?;
+        } else {
+            return Err(anyhow::anyhow!(
+                "Cannot move tasks between projects: v2 API authentication required.\n\
+                Set v2_token in {} or use username/password.",
+                Config::config_path().unwrap_or_default().display()
+            ));
+        }
+        
+        client_for_move.move_task(task_id, current_project_id, &target_project_id).await
+            .map_err(|e| anyhow::anyhow!("Failed to move task: {}", e))?;
+    }
 
     // Parse dates
     let (start_date, due_date) = parse_task_dates(date, start, due)?;
@@ -798,7 +920,7 @@ async fn cmd_task_update(
 
     let request = UpdateTaskRequest {
         id: task_id.to_string(),
-        project_id: project_id.clone(),
+        project_id: target_project_id.clone(),
         title,
         content,
         is_all_day: all_day,
@@ -811,7 +933,6 @@ async fn cmd_task_update(
         items: items_vec,
     };
 
-    let client = TickTickClient::new()?;
     let task = client.update_task(task_id, &request).await?;
 
     if quiet {

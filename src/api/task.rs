@@ -229,6 +229,54 @@ impl TickTickClient {
         self.post(&endpoint, request).await
     }
 
+    /// Move a task to a different project using the v2 API
+    ///
+    /// POST /batch/taskProject
+    /// This is needed because the Open API v1 silently ignores project changes
+    #[instrument(skip(self))]
+    pub async fn move_task(
+        &self,
+        task_id: &str,
+        from_project_id: &str,
+        to_project_id: &str,
+    ) -> Result<(), ApiError> {
+        debug!(
+            "Moving task {} from {} to {}",
+            task_id, from_project_id, to_project_id
+        );
+
+        #[derive(Debug, serde::Serialize)]
+        struct MoveTaskRequest {
+            #[serde(rename = "fromProjectId")]
+            from_project_id: String,
+            #[serde(rename = "taskId")]
+            task_id: String,
+            #[serde(rename = "toProjectId")]
+            to_project_id: String,
+        }
+
+        // Special case: v2 API requires full inbox ID (inbox<userId>) for the target project
+        let to_project = if to_project_id == "inbox" {
+            // Get full inbox ID from preferences
+            match self.get_inbox_id().await {
+                Ok(inbox_id) => inbox_id,
+                Err(_) => "inbox127635041".to_string(), // Fallback to known ID
+            }
+        } else {
+            to_project_id.to_string()
+        };
+
+        // The v2 API expects an array of move requests
+        let request = vec![MoveTaskRequest {
+            from_project_id: from_project_id.to_string(),
+            task_id: task_id.to_string(),
+            to_project_id: to_project,
+        }];
+
+        // The v2 API returns empty body on success
+        self.post_v2_empty("/batch/taskProject", &request).await
+    }
+
     /// Delete a task
     ///
     /// DELETE /project/{projectId}/task/{taskId}

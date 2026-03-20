@@ -14,6 +14,15 @@ pub struct Config {
     /// Default color for new projects
     #[serde(default = "default_project_color")]
     pub default_project_color: String,
+    /// TickTick username for v2 API session authentication
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// TickTick password for v2 API session authentication
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Pre-obtained v2 session token (can be extracted from browser after login)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v2_token: Option<String>,
 }
 
 fn default_project_color() -> String {
@@ -25,6 +34,9 @@ impl Default for Config {
         Self {
             default_project_id: None,
             default_project_color: default_project_color(),
+            username: None,
+            password: None,
+            v2_token: None,
         }
     }
 }

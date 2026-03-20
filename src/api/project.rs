@@ -103,9 +103,21 @@ impl TickTickClient {
     pub async fn get_project(&self, id: &str) -> Result<Project, ApiError> {
         debug!("Getting project: {}", id);
 
-        // Handle special INBOX case
+        // Handle special INBOX case - fetch full ID from v2 API
         if id == INBOX_PROJECT_ID {
-            return Ok(Project::inbox());
+            // Get the full inbox ID from v2 API
+            let full_inbox_id = self.get_inbox_id().await?;
+            return Ok(Project {
+                id: full_inbox_id,
+                name: "Inbox".to_string(),
+                color: String::new(),
+                sort_order: -1,
+                closed: false,
+                group_id: None,
+                view_mode: "list".to_string(),
+                permission: None,
+                kind: "TASK".to_string(),
+            });
         }
 
         let endpoint = format!("/project/{}", id);
